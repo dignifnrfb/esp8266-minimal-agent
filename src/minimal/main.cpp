@@ -12,7 +12,7 @@
 
 extern "C" uint32_t _FS_start, _FS_end;
 namespace {
-constexpr char Version[] = "minimal-agent-0.1.0";
+constexpr char Version[] = "minimal-agent-0.1.1";
 constexpr char ConfigFile[] = "/minimal.json";
 // Preserve the same high-water/result journal when changing firmware families.
 constexpr char JournalFile[] = "/gateway-job.json";
@@ -128,7 +128,10 @@ bool post(const char* path, const String& request, String& response) {
   if (!http.begin(client, serverUrl + path)) { error = "http_begin_failed"; return false; }
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", String("Bearer ") + token);
-  { HeapSelectIram second; httpStatus = http.POST(request); }
+  // BearSSL allocates its full RX/TX buffers from IRAM with DRAM fallback.
+  // Keep the engine/X509 objects in DRAM: selecting IRAM for the whole POST
+  // lets the RX buffer exhaust it before make_shared<X509> and causes a panic.
+  { HeapSelectDram primary; httpStatus = http.POST(request); }
   tlsError = client.getLastSSLError();
   Body body;
   bool ok = httpStatus == 200 && http.getSize() <= static_cast<int>(minimal::MaxWire);
@@ -170,7 +173,8 @@ bool updateFirmware(const String& path, uint32_t bytes, const String& sha) {
     if (!http.begin(client, serverUrl + path)) error = "update_http_begin_failed";
     else {
       http.addHeader("Authorization", String("Bearer ") + token);
-      { HeapSelectIram second; httpStatus = http.GET(); }
+      // Same allocation split as polling; the full TLS buffers still use IRAM.
+      { HeapSelectDram primary; httpStatus = http.GET(); }
       tlsError = client.getLastSSLError();
       if (httpStatus != 200 || http.getSize() != static_cast<int>(bytes)) error = "update_http_or_size_mismatch";
       else if (!Update.begin(bytes, U_FLASH)) error = "update_begin_failed";

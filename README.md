@@ -1,8 +1,10 @@
 # ESP8266 minimal_agent 源码
 
-独立的 `minimal-agent-0.1.0` PlatformIO 工程，目标为 NodeMCU / ESP8266、4 MiB Flash、1 MiB LittleFS。包含可构建源码、USB 配置脚本、服务器签名脚本和主机测试。
+独立的 `minimal-agent-0.1.1` PlatformIO 工程，目标为 NodeMCU / ESP8266、4 MiB Flash、1 MiB LittleFS。包含可构建源码、USB 配置脚本、服务器签名脚本和主机测试。
 
 板端保留 Wi-Fi、NTP、TLS 1.2、设备认证、任务轮询/结果、持久化去重、RSA2048 签名的完整固件 HTTPS 拉取升级。网页、模型、对话历史和编译器由服务器实现。源码不包含设备凭据，也不依赖原工程。
+
+**请使用 0.1.1 或后续版本。** 0.1.0 的首次实板验证发现 TLS 分配内存时会 panic 重启：把整个 HTTP 调用切到 IRAM，会让接收缓冲占去证书校验对象需要的空间。0.1.1 将 TLS 引擎和 X509 对象放入 DRAM，由框架继续优先使用 IRAM 分配完整收发缓冲，保留 DRAM 回退、16 KiB 接收缓冲、CA/域名/时间校验及原有内存准入门槛。
 
 ## 构建和验证
 
@@ -23,7 +25,7 @@ python tools/check.py --skip-build
 
 若工具链装在非默认目录，设置 `PLATFORMIO_CORE_DIR`。若验证另一份产物，设置 `MINIMAL_FIRMWARE`。仅构建与签名测试不代表已完成真实设备 OTA 测试。
 
-2026-10-23 已从独立目录构建成功：程序 Flash 457,607 字节、静态 RAM 31,796 字节，45 项协议检查和 9 项签名包测试全部通过。此验证只使用已安装的工具链与新工程下载的依赖，不需要原工程的源码或配置。真实设备未烧录，真实 OTA 尚未测试。
+2026-10-23，0.1.1 已从独立目录构建成功：程序 Flash 457,607 字节、静态 RAM 31,796 字节，45 项协议检查和 9 项签名包测试全部通过。已在匹配的实板上完成 USB 安装、公钥配置、真实服务器 HTTPS 连续轮询、受控重启后的配置保留和重新联网验证。观察期间 DRAM 空闲堆约 41–43 KB；这是串口状态采样，不能视为 TLS 峰值用量。签名 OTA 下载、验签提交及新版本启动的完整闭环尚未实测。
 
 ## 服务器签名兼容性
 
@@ -39,7 +41,7 @@ python tools/check.py --skip-build
 # private/ 目录必须在仓库外保存备份；私钥仅由服务器持有。
 mkdir private
 python tools/minimal_sign.py keygen --private private/release-private.pem --public private/release-public.pem
-python tools/minimal_sign.py sign --private private/release-private.pem --image .pio/build/minimal_agent/firmware.bin --out private/release.bin.signed --version minimal-agent-0.1.0 --path /v1/firmware/release.bin.signed
+python tools/minimal_sign.py sign --private private/release-private.pem --image .pio/build/minimal_agent/firmware.bin --out private/release.bin.signed --version minimal-agent-0.1.1 --path /v1/firmware/release.bin.signed
 python tools/minimal_sign.py verify --public private/release-public.pem --image private/release.bin.signed
 ```
 
@@ -75,7 +77,7 @@ python tools/minimal_sign.py verify --public private/release-public.pem --image 
     "type": "firmware_update",
     "args": {
       "path": "/v1/firmware/release.bin.signed",
-      "version": "minimal-agent-0.1.0",
+      "version": "minimal-agent-0.1.1",
       "target": "esp8266:nodemcuv2:4m1m",
       "size": 500000,
       "sha256": "REPLACE_WITH_WHOLE_SIGNED_PACKAGE_SHA256"
@@ -94,7 +96,7 @@ JSON 响应最多 2048 字节。升级 GET 必须返回 200、准确的 `Content
 
 ## 首次 USB 配置
 
-**本仓库尚未在真实板子上烧录或验证 OTA。** 首次将旧固件迁移到本固件需要 USB；现有完整固件不是此最小版本，不应直接按本协议向旧固件下发升级。
+**USB 安装和联网恢复已实板验证，签名 OTA 完整闭环尚未验证。** 首次迁移使用 USB 安装及配置；现有完整固件使用不同的任务能力，不应直接按本协议向旧固件下发升级。
 
 准备私有 JSON，字段如下（值由设备持有者填写）：
 
