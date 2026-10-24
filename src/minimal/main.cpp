@@ -12,7 +12,12 @@
 
 extern "C" uint32_t _FS_start, _FS_end;
 namespace {
-constexpr char Version[] = "minimal-agent-0.1.1";
+constexpr char Version[] = "minimal-agent-0.1.4-breathe-diag";
+// User-confirmed board LED: GPIO2 / D4. Do not touch any other GPIO.
+constexpr uint8_t DemoLedPin = 2;
+// User confirmed LOW = on and HIGH = off; no other GPIO is probed.
+constexpr bool DemoLedActiveLow = true;
+bool demoLedStarted = false;
 constexpr char ConfigFile[] = "/minimal.json";
 // Preserve the same high-water/result journal when changing firmware families.
 constexpr char JournalFile[] = "/gateway-job.json";
@@ -25,6 +30,70 @@ uint32_t lastSeq = 0, pollsOk = 0, resultsOk = 0, lastSuccess = 0;
 uint32_t nextAt = 0, pollMs = 3000, retryMs = 3000, rebootAt = 0;
 int httpStatus = 0, tlsError = 0;
 BearSSL::Session tlsSession;
+
+void setDemoLed(bool on) {
+  digitalWrite(DemoLedPin, (on != DemoLedActiveLow) ? HIGH : LOW);
+}
+// One 1 kHz software-PWM channel. No user ISR, allocation or delay here.
+constexpr uint16_t LedRange = 1023, LedMinimum = 103, LedMaximum = 818;
+uint16_t ledFrom = LedMinimum, ledTo = LedMinimum, ledNextLow = LedMinimum;
+uint32_t ledLast = 0, ledElapsed = 0, ledHalfPeriod = 1000;
+bool ledRising = true;
+uint32_t ledRandom(uint32_t first, uint32_t last) {
+  return first + ESP.random() % (last - first + 1);
+}
+void nextLedCycle() {
+  // Previous falling endpoint is the next rising start: no cycle-boundary jump.
+  ledTo = ledRandom(563, LedMaximum); // peak 55..80 percent
+  ledNextLow = ledRandom(LedMinimum, 358); // trough 10..35 percent
+  ledHalfPeriod = ledRandom(1000, 3000); // full cycle 2..6 active seconds
+  ledRising = true; ledElapsed = 0;
+}
+uint16_t ledCurve(uint16_t from, uint16_t to, uint32_t elapsed, uint32_t duration) {
+  uint32_t t = min<uint32_t>(elapsed, duration) * 1024u / duration;
+  uint32_t eased = t * t * (3072u - 2u * t) / 1048576u;
+  return static_cast<uint16_t>(static_cast<int32_t>(from) +
+      (static_cast<int32_t>(to) - from) * static_cast<int32_t>(eased) / 1024);
+}
+void tickDemoLed() {
+  if (!demoLedStarted) {
+    if (!(pollsOk > 0 && enabled && !paused && WiFi.status() == WL_CONNECTED)) return;
+    demoLedStarted = true; ledLast = millis(); nextLedCycle();
+    analogWrite(DemoLedPin, LedRange - LedMinimum);
+    return;
+  }
+  uint32_t now = millis(), elapsed = now - ledLast;
+  if (elapsed < 10) return;
+  ledLast = now;
+  // Synchronous HTTP/OTA can stall loop(). Freeze rather than skip visibly
+  // through the envelope after a stall. Wall-clock cycles can exceed 6 s.
+  ledElapsed = min<uint32_t>(ledElapsed + min<uint32_t>(elapsed, 20), ledHalfPeriod);
+  uint16_t brightness = ledCurve(ledFrom, ledTo, ledElapsed, ledHalfPeriod);
+  analogWrite(DemoLedPin, LedRange - brightness); // active LOW
+  if (ledElapsed == ledHalfPeriod) {
+    ledFrom = ledTo;
+    if (ledRising) { ledTo = ledNextLow; ledRising = false; ledElapsed = 0; }
+    else nextLedCycle();
+  }
+}
+// Immutable boot evidence. No raw reset strings, credentials, flash writes or
+// RTC user memory (whose first 128 bytes are reserved for the OTA bootloader).
+uint32_t bootHeap = 0;
+uint32_t bootReason = 0xffffffffu, bootCause = 0, bootEpc = 0, bootAddress = 0;
+void captureBootDiagnostic() {
+  bootHeap = ESP.getFreeHeap();
+  const auto* info = ESP.getResetInfoPtr();
+  if (info) {
+    bootReason = info->reason; bootCause = info->exccause;
+    bootEpc = info->epc1; bootAddress = info->excvaddr;
+  }
+}
+void bootDiagnostic(JsonObject o) {
+  o["v"] = 1; o["reason"] = bootReason; o["prev_valid"] = false; o["boot_heap"] = bootHeap;
+  if (bootReason >= 1 && bootReason <= 3) {
+    o["exccause"] = bootCause; o["epc1"] = bootEpc; o["excvaddr"] = bootAddress;
+  }
+}
 
 String readFile(const char* path, size_t limit) {
   File f = LittleFS.open(path, "r");
@@ -277,12 +346,16 @@ void tick() {
       } else error = "invalid_ack_or_checkpoint_failed";
     }
   } else {
-    { DynamicJsonDocument d(768); envelope(d);
+    { DynamicJsonDocument d(1024); envelope(d);
       d["firmware"] = Version; d["last_seq"] = lastSeq; d["uptime_s"] = millis()/1000;
       d["heap"] = ESP.getFreeHeap(); d["rssi"] = WiFi.RSSI();
       JsonArray types = d.createNestedArray("job_types");
       types.add("status"); types.add("device_inspect"); types.add("firmware_update");
       d["target"] = minimal::Target; d["signed_ota_ready"] = !publicKey.isEmpty();
+      bootDiagnostic(d.createNestedObject("boot_diag"));
+      if (d.overflowed() || measureJson(d) > minimal::MaxWire) {
+        error = "poll_serialization_overflow"; nextAt = millis() + 3000; return;
+      }
       serializeJson(d, request); }
     if (post("/v1/device/poll", request, response)) receivePoll(response);
     success = pollsOk > previousPolls;
@@ -325,6 +398,10 @@ void serialControl() {
 }
 }
 void setup() {
+  // Preload the inactive level before enabling the output to avoid a flash.
+  setDemoLed(false); pinMode(DemoLedPin, OUTPUT);
+  analogWriteRange(LedRange); analogWriteFreq(1000);
+  captureBootDiagnostic();
   Serial.begin(115200);
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true);
   WiFi.hostname("esp8266-minimal");
@@ -352,4 +429,4 @@ void setup() {
   configTime(0,0,"ntp.aliyun.com","time.cloudflare.com","pool.ntp.org");
   Serial.println(); Serial.println(status());
 }
-void loop() { serialControl(); tick(); delay(1); }
+void loop() { serialControl(); tickDemoLed(); tick(); delay(1); }

@@ -1,127 +1,48 @@
-# ESP8266 minimal_agent 源码
+# minimal-agent-0.1.4-breathe-diag 源码快照
 
-独立的 `minimal-agent-0.1.1` PlatformIO 工程，目标为 NodeMCU / ESP8266、4 MiB Flash、1 MiB LittleFS。包含可构建源码、USB 配置脚本、服务器签名脚本和主机测试。
+本分支保存已通过签名 OTA 安装的 0.1.4 源码，供本地复现和排查。它不是看门狗问题修复版，也不是新的部署。main 分支未修改。
 
-板端保留 Wi-Fi、NTP、TLS 1.2、设备认证、任务轮询/结果、持久化去重、RSA2048 签名的完整固件 HTTPS 拉取升级。网页、模型、对话历史和编译器由服务器实现。源码不包含设备凭据，也不依赖原工程。
+## 源码身份
+- 原始构建基线：`f472400415fe753edae1733d4a2049d6aef953f1`。
+- 固件版本字符串：`minimal-agent-0.1.4-breathe-diag`（结尾是 diag）。
+- `src/minimal/main.cpp` SHA-256：
+  `a1c2a7663d80cb0f6181a84b8e32464a5b0ea59428c1c0fd68bf1f50dd31464a`。
+- 除 main.cpp 和本说明外，构建配置、protocol.h、工具及原有测试均保留上述基线原文。未混入后续修复。
+- 源码相同不保证不同路径或工具环境下的二进制逐字节相同；排查地址必须配套实际构建的 ELF。
 
-**请使用 0.1.1 或后续版本。** 0.1.0 的首次实板验证发现 TLS 分配内存时会 panic 重启：把整个 HTTP 调用切到 IRAM，会让接收缓冲占去证书校验对象需要的空间。0.1.1 将 TLS 引擎和 X509 对象放入 DRAM，由框架继续优先使用 IRAM 分配完整收发缓冲，保留 DRAM 回退、16 KiB 接收缓冲、CA/域名/时间校验及原有内存准入门槛。
-
-## 构建和验证
-
-建议 Python 3.11 及以上；主机测试还需 `g++` 和 OpenSSL 命令行工具。Linux 可先安装 `python3-venv build-essential openssl`。Windows 使用 Python、MinGW g++ 和 OpenSSL，并将其加入 PATH。
+## 本地构建（不烧录）
+建议 Python 3.11+。仓库锁定 PlatformIO 6.2.0、espressif8266 4.2.1（ESP8266 Arduino 3.1.2）和 ArduinoJson 6.21.5。
 
 ```sh
+git clone --branch snapshot/minimal-agent-0.1.4-breathe-diag --single-branch https://github.com/dignifnrfb/esp8266-minimal-agent.git
+cd esp8266-minimal-agent
 python -m venv .venv
-# Linux/macOS: source .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# Linux/macOS 则使用：source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m platformio run -e minimal_agent -j 1
-python tools/check.py --skip-build
 ```
 
-`python tools/check.py` 会先编译再验证。首次编译需下载工具链和锁定版本的 ArduinoJson 6.21.5；不需要访问设备服务器。`-j 1` 限制并行编译，适合资源较少的服务器。
+产物：`.pio/build/minimal_agent/firmware.bin` 和同目录 `firmware.elf`。
+目标 NodeMCU v2，4 MiB Flash / 1 MiB LittleFS，160 MHz、DIO，内存布局由 platformio.ini 指定。
 
-产物为 `.pio/build/minimal_agent/firmware.bin`。`platformio.ini` 锁定 espressif8266 4.2.1、ArduinoJson 6.21.5，以及原板使用的 Flash/内存布局。测试包含 45 项协议边界检查及 9 项签名包检查，其中一项与已安装 ESP8266 Arduino 框架的 `tools/signing.py` 输出逐字节比较。
+可选主机检查：安装 g++ 和 OpenSSL CLI 后运行 `python tools/check.py --skip-build`。原有测试检查协议和签名包，不验证呼吸灯的实际时序，也不能证明设备不会重启。本次仅发布已安装源码，未重新运行完整工具链测试。
 
-若工具链装在非默认目录，设置 `PLATFORMIO_CORE_DIR`。若验证另一份产物，设置 `MINIMAL_FIRMWARE`。仅构建与签名测试不代表已完成真实设备 OTA 测试。
+Windows 可用 `Get-FileHash src/minimal/main.cpp -Algorithm SHA256` 检查源码；Linux 使用 `sha256sum src/minimal/main.cpp`。
 
-2026-10-23，0.1.1 已从独立目录构建成功：程序 Flash 457,607 字节、静态 RAM 31,796 字节，45 项协议检查和 9 项签名包测试全部通过。已在匹配的实板上完成 USB 安装、公钥配置、真实服务器 HTTPS 连续轮询、受控重启后的配置保留和重新联网验证。观察期间 DRAM 空闲堆约 41–43 KB；这是串口状态采样，不能视为 TLS 峰值用量。签名 OTA 下载、验签提交及新版本启动的完整闭环尚未实测。
+## 当前行为及排查边界
+- GPIO2 / D4 板载 LED，低电平点亮；首次认证轮询成功后启动随机平滑呼吸。
+- PWM 1 kHz，范围显式设为 1023，亮度约 10%～80%。每轮 2～6 秒是有效动画时间；同步 TLS/HTTP/OTA 会暂停亮度包络，因此墙钟周期可能更长。
+- 每次轮询附带同一个 boot_diag：版本 v=1、reason、boot_heap、prev_valid=false；reason 1～3 时附带 exccause、epc1、excvaddr。服务器必须支持该字段。
+- 不写 RTC 或额外 Flash 故障日志。突然断电或首次成功上报前的重启可能没有完整记录，boot_heap 只是重启后的快照。
+- 已观察到软件看门狗（reason=3）及硬件看门狗（reason=1）重启，根因尚未确认。硬件看门狗不等于硬件损坏。
+- exccause=4 是一级中断，该情况下 EXCVADDR 不更新，不能把 excvaddr 当作非法访问地址。匹配 ELF 的 epc1 符号有助分析，但单个地址不等于根因。
+- 完整串口崩溃输出可能有更多信息，应用串口速率 115200；启动 ROM 输出使用 74880。保存与固件匹配的 ELF，分享日志前去除凭据和个人网络信息。
 
-## 服务器签名兼容性
+参考：[官方 SDK reset 枚举](https://github.com/esp8266/Arduino/blob/3.1.2/tools/sdk/include/user_interface.h)、[官方异常代码表](https://arduino-esp8266.readthedocs.io/en/3.1.2/exception_causes.html)。
 
-签名格式直接兼容 ESP8266 Arduino Updater：
+## 配置和升级注意
+本仓库不含真实 Wi-Fi 密码、设备 Token、生产公私钥、服务端凭据或设备配置；这些仍由设备持有者私下保管。配置沿用 LittleFS，不应为排查直接擦除或上传文件系统。
 
-```text
-未压缩的 firmware.bin | RSA2048 签名（256 字节） | uint32_le(256)
-```
-
-签名算法为 RSA PKCS#1 v1.5 + SHA-256，签名覆盖原始 `firmware.bin`。任务的 `size` 和 `sha256` 覆盖**整个签名包**，包括签名及长度尾部。仅支持未压缩、首字节为 `0xE9` 的应用镜像，签名包最多 1,048,576 字节；板端还会检查实际可用升级空间。
-
-```sh
-# private/ 目录必须在仓库外保存备份；私钥仅由服务器持有。
-mkdir private
-python tools/minimal_sign.py keygen --private private/release-private.pem --public private/release-public.pem
-python tools/minimal_sign.py sign --private private/release-private.pem --image .pio/build/minimal_agent/firmware.bin --out private/release.bin.signed --version minimal-agent-0.1.1 --path /v1/firmware/release.bin.signed
-python tools/minimal_sign.py verify --public private/release-public.pem --image private/release.bin.signed
-```
-
-`sign` 同时生成 `private/release.bin.signed.job.json`，内容是任务 `type` 和 `args`；服务器需要另加 `seq`、`id`，放进轮询响应的 `job`。私钥、真实配置和固件产物均被 `.gitignore` 排除。脚本拒绝覆盖现有密钥或发布产物。签名测试使用临时密钥，不会建立生产签名身份。
-
-## HTTP 协议 1
-
-所有设备请求使用 `Authorization: Bearer <device_token>`。配置 `server_url` 不带结尾 `/`；固件拼接以下路径：
-
-| 请求 | 用途 |
-| --- | --- |
-| `POST /v1/device/poll` | 心跳和取一个任务 |
-| `POST /v1/device/result` | 上报结果，未确认时重试 |
-| `GET /v1/firmware/<name>` | 下载带签名的固件；也附带设备认证 |
-
-轮询请求含 `protocol:1`、`device_id`、`boot_id`、`firmware`、`last_seq`、`uptime_s`、`heap`、`rssi`、`target`、`signed_ota_ready`、`job_types`。设备 ID 自动取 `esp8266-` 加无冒号的小写 MAC。
-
-无任务的响应：
-
-```json
-{"protocol":1,"poll_after_ms":3000,"job":null}
-```
-
-升级任务响应结构如下；用签名脚本生成的真实参数替换示例占位值：
-
-```json
-{
-  "protocol": 1,
-  "poll_after_ms": 3000,
-  "job": {
-    "seq": 1,
-    "id": "release-1",
-    "type": "firmware_update",
-    "args": {
-      "path": "/v1/firmware/release.bin.signed",
-      "version": "minimal-agent-0.1.1",
-      "target": "esp8266:nodemcuv2:4m1m",
-      "size": 500000,
-      "sha256": "REPLACE_WITH_WHOLE_SIGNED_PACKAGE_SHA256"
-    }
-  }
-}
-```
-
-支持的任务仅为 `status`（`args:{}`）、`device_inspect`（`args:{"resource":"environment"}`）和 `firmware_update`。任务 `seq` 必须是单设备严格递增的正 uint32；服务器应在收到确认之前保持同一个未完成任务，并按设备持久化序号，不能重置为 1。未知任务会返回终态失败。
-
-结果请求含 `protocol`、`device_id`、`boot_id`、`seq`、`id`、`status`、`ok`、`data`。正确的确认响应是 `{"protocol":1,"ack":<该任务seq>}`。`status` 为 `completed`，或断电恢复情况下的 `indeterminate`；后者表示不能确定执行结果，服务器不应以新序号自动重放有副作用的动作。
-
-JSON 响应最多 2048 字节。升级 GET 必须返回 200、准确的 `Content-Length` 和完整签名包，不支持 chunked、重定向或跨站下载。路径限 `/v1/firmware/` 下的安全字符。TLS 验证 CA、域名和时间，保留 16 KiB 接收缓冲；没有 `setInsecure()` 或 HTTP 降级。
-
-下载先检查完整包 SHA-256，再由框架验证 RSA 签名并提交升级。成功结果中的 `data.state` 为 `verified_pending_reboot`，收到 ACK 后或最多 10 秒后重启；服务器还需等待新版本心跳才可标记部署完成。任务 `version` 只是请求元数据，不能代替实际运行版本验证。更新业务版本时应同时修改 `src/minimal/main.cpp` 的 `Version` 字符串。
-
-## 首次 USB 配置
-
-**USB 安装和联网恢复已实板验证，签名 OTA 完整闭环尚未验证。** 首次迁移使用 USB 安装及配置；现有完整固件使用不同的任务能力，不应直接按本协议向旧固件下发升级。
-
-准备私有 JSON，字段如下（值由设备持有者填写）：
-
-| 字段 | 说明 |
-| --- | --- |
-| `wifi_ssid` | 1–32 字节 |
-| `wifi_password` | 空字符串或 8–64 字节 |
-| `server_url` | HTTPS 地址，可包含端口/路径前缀 |
-| `device_token` | 24–192 个可打印 ASCII 字符，无空白 |
-| `ca_pem` | 完整 PEM 根证书，64–4096 字节 |
-| `enabled` | 布尔值，是否启用轮询 |
-| `allow_lan_http` | 必须为 `false` |
-| `poll_ms` | 1000–60000，建议 3000 |
-| `firmware_public_key` | 可选，RSA2048 公钥 PEM；未配置时禁用升级 |
-
-本地首次 USB 烧录及配置示例，替换端口和实际设备 ID：
-
-```sh
-python -m platformio run -e minimal_agent -t upload --upload-port YOUR_PORT
-python tools/minimal_serial.py --port YOUR_PORT
-python tools/minimal_serial.py --port YOUR_PORT --device-id YOUR_DEVICE_ID --config private/config.json --public-key private/release-public.pem --enable
-```
-
-读取状态不要求预先知道 ID；写配置或暂停/恢复必须显式提供匹配 ID。配置脚本只输出脱敏状态，拒绝向非 minimal 固件写配置。配置保存在 LittleFS 的 `/minimal.json`；任务日志保留 `/gateway-job.json`、`/gateway-ack`，以兼容原设备任务序号。
-
-串口速度 115200，支持 `status`、`pause`、`resume`、`reboot`、`config <一行JSON>`。没有板载网页、配网热点或局域网 OTA 推送服务。全新空白文件系统可初始化；损坏的非空文件系统不会自动格式化，需要人工恢复。
-
-完整固件更新能够替换应用和驱动，需后续固件继续保留网络、签名升级与相同 Flash 布局。该方案没有独立不可改写的安全监管层，也没有自动回滚；错误应用仍可能需要 USB 恢复。
+[原始基线的协议及 USB 配置说明](https://github.com/dignifnrfb/esp8266-minimal-agent/blob/f472400415fe753edae1733d4a2049d6aef953f1/README.md)中的示例版本号属于旧版本，配置格式与签名协议仍适用。不要运行 keygen 替换现有生产签名身份；普通本地构建不需要私钥。这个分支没有自动回滚能力，错误固件可能需要 USB 恢复。
