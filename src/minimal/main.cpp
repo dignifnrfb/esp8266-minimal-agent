@@ -8,11 +8,12 @@
 #include <WiFiClientSecureBearSSL.h>
 #include <umm_malloc/umm_heap_select.h>
 #include <time.h>
+#include <cont.h>
 #include "protocol.h"
 
 extern "C" uint32_t _FS_start, _FS_end;
 namespace {
-constexpr char Version[] = "minimal-agent-0.1.4-breathe-diag";
+constexpr char Version[] = "minimal-agent-0.1.5-stack-fix";
 // User-confirmed board LED: GPIO2 / D4. Do not touch any other GPIO.
 constexpr uint8_t DemoLedPin = 2;
 // User confirmed LOW = on and HIGH = off; no other GPIO is probed.
@@ -165,6 +166,11 @@ void state(JsonObject o) {
   o["last_success_uptime_s"] = lastSuccess / 1000;
   o["http_status"] = httpStatus; o["tls_error"] = tlsError;
   o["poll_ms"] = pollMs; o["error"] = error;
+  bool stackOk = g_pcont->stack_end == g_pcont->stack + CONT_STACKSIZE/4 &&
+      g_pcont->stack_guard1 == 0xfeefeffe && g_pcont->stack_guard2 == 0xfeefeffe;
+  o["stack_ok"] = stackOk;
+  o["stack_free"] = stackOk ? ESP.getFreeContStack() : 0;
+  o["reset_reason"] = bootReason;
 }
 String status() {
   DynamicJsonDocument d(1536); state(d.to<JsonObject>());
@@ -220,15 +226,56 @@ bool result(uint32_t seq, const String& id, const char* outcome, bool ok, const 
   journal = std::move(out); lastSeq = seq; pending = true; return true;
 }
 
+// This stage never performs the TLS handshake. Keep its hash and 512-byte
+// staging buffer out of the caller's frame while HTTPClient connects.
+__attribute__((noinline)) bool streamFirmware(HTTPClient& http, uint32_t bytes, const String& sha) {
+  BearSSL::HashSHA256 packageHash;
+  bool committed = false;
+  packageHash.begin(); uint32_t received = 0, started = millis(), lastByte = started;
+  size_t withheld = 0;
+  uint8_t buffer[512];
+  WiFiClient* stream = http.getStreamPtr();
+  while (received < bytes && millis() - started < 180000 && millis() - lastByte < 8000) {
+    int ready = stream->available();
+    if (ready > 0) {
+      size_t count = min<size_t>(sizeof(buffer), min<uint32_t>(ready, bytes - received));
+      int n = stream->read(buffer, count);
+      if (n <= 0) break;
+      packageHash.add(buffer, n);
+      // Keep the final block out of Updater until the package hash is
+      // checked. end(false) can then safely abort any rejected download:
+      // it must never see a complete image on a SHA-mismatch path.
+      if (received + static_cast<uint32_t>(n) == bytes) {
+        received += n; withheld = n; break;
+      }
+      if (Update.write(buffer, n) != static_cast<size_t>(n)) break;
+      received += n; lastByte = millis();
+    } else if (!stream->connected()) break;
+    delay(0);
+  }
+  packageHash.end();
+  const uint8_t* digest = static_cast<const uint8_t*>(packageHash.hash());
+  char hex[65];
+  for (size_t i = 0; i < 32; ++i) snprintf(hex + 2*i, 3, "%02x", digest[i]);
+  if (received != bytes) error = "update_incomplete_or_timeout";
+  else if (!sha.equalsIgnoreCase(hex)) error = "update_package_sha256_mismatch";
+  else if (!withheld || Update.write(buffer, withheld) != withheld) error = "update_write_failed";
+  else if (!Update.end()) error = "update_signature_or_image_rejected";
+  else { committed = true; error = "none"; }
+  if (!committed) Update.end(false);
+  return committed;
+}
+
 // Stream into the OTA staging area. Updater commits only after both the package
 // SHA256 and the required RSA signature validate; never buffer a whole image.
-bool updateFirmware(const String& path, uint32_t bytes, const String& sha) {
+// Do not inline OTA locals into receivePoll/tick: ordinary HTTPS polling has
+// only 4 KiB of continuation stack and must not reserve the OTA frame.
+__attribute__((noinline)) bool updateFirmware(const String& path, uint32_t bytes, const String& sha) {
   if (publicKey.isEmpty()) { error = "firmware_signing_key_not_configured"; return false; }
   if (ESP.getFreeHeap() < 28500 || bytes > ESP.getFreeSketchSpace()) { error = "insufficient_update_space"; return false; }
   BearSSL::PublicKey key(publicKey.c_str());
   BearSSL::HashSHA256 imageHash;
   BearSSL::SigningVerifier verifier(&key);
-  BearSSL::HashSHA256 packageHash;
   Update.installSignature(&imageHash, &verifier);
   bool committed = false;
   {
@@ -248,38 +295,7 @@ bool updateFirmware(const String& path, uint32_t bytes, const String& sha) {
       if (httpStatus != 200 || http.getSize() != static_cast<int>(bytes)) error = "update_http_or_size_mismatch";
       else if (!Update.begin(bytes, U_FLASH)) error = "update_begin_failed";
       else {
-        packageHash.begin(); uint32_t received = 0, started = millis(), lastByte = started;
-        size_t withheld = 0;
-        uint8_t buffer[512];
-        WiFiClient* stream = http.getStreamPtr();
-        while (received < bytes && millis() - started < 180000 && millis() - lastByte < 8000) {
-          int ready = stream->available();
-          if (ready > 0) {
-            size_t count = min<size_t>(sizeof(buffer), min<uint32_t>(ready, bytes - received));
-            int n = stream->read(buffer, count);
-            if (n <= 0) break;
-            packageHash.add(buffer, n);
-            // Keep the final block out of Updater until the package hash is
-            // checked. end(false) can then safely abort any rejected download:
-            // it must never see a complete image on a SHA-mismatch path.
-            if (received + static_cast<uint32_t>(n) == bytes) {
-              received += n; withheld = n; break;
-            }
-            if (Update.write(buffer, n) != static_cast<size_t>(n)) break;
-            received += n; lastByte = millis();
-          } else if (!stream->connected()) break;
-          delay(0);
-        }
-        packageHash.end();
-        const uint8_t* digest = static_cast<const uint8_t*>(packageHash.hash());
-        char hex[65];
-        for (size_t i = 0; i < 32; ++i) snprintf(hex + 2*i, 3, "%02x", digest[i]);
-        if (received != bytes) error = "update_incomplete_or_timeout";
-        else if (!sha.equalsIgnoreCase(hex)) error = "update_package_sha256_mismatch";
-        else if (!withheld || Update.write(buffer, withheld) != withheld) error = "update_write_failed";
-        else if (!Update.end()) error = "update_signature_or_image_rejected";
-        else { committed = true; error = "none"; }
-        if (!committed) Update.end(false); // abort incomplete/unverified staging
+        committed = streamFirmware(http, bytes, sha); // abort incomplete/unverified staging
       }
       http.end(); client.stop();
     }
@@ -289,7 +305,8 @@ bool updateFirmware(const String& path, uint32_t bytes, const String& sha) {
   return committed;
 }
 
-void receivePoll(String& response) {
+// Keep poll transport and job execution in separate stack frames.
+__attribute__((noinline)) void receivePoll(String& response) {
   DynamicJsonDocument d(1536);
   if (response.isEmpty() || deserializeJson(d, &response[0]) || !d["protocol"].is<int>() ||
       d["protocol"] != 1 || !d.containsKey("job")) { error = "invalid_poll"; return; }

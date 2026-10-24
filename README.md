@@ -1,48 +1,51 @@
-# minimal-agent-0.1.4-breathe-diag 源码快照
+# minimal-agent-0.1.5-stack-fix
 
-本分支保存已通过签名 OTA 安装的 0.1.4 源码，供本地复现和排查。它不是看门狗问题修复版，也不是新的部署。main 分支未修改。
+修复 `0.1.4-breathe-diag` 在 HTTPS 轮询期间反复触发看门狗的问题，基于源码快照 `256564e7dc47f57a5c4445c0a672cc39db81662b`。
 
-## 源码身份
-- 原始构建基线：`f472400415fe753edae1733d4a2049d6aef953f1`。
-- 固件版本字符串：`minimal-agent-0.1.4-breathe-diag`（结尾是 diag）。
-- `src/minimal/main.cpp` SHA-256：
-  `a1c2a7663d80cb0f6181a84b8e32464a5b0ea59428c1c0fd68bf1f50dd31464a`。
-- 除 main.cpp 和本说明外，构建配置、protocol.h、工具及原有测试均保留上述基线原文。未混入后续修复。
-- 源码相同不保证不同路径或工具环境下的二进制逐字节相同；排查地址必须配套实际构建的 ELF。
+## 原因和修复
 
-## 本地构建（不烧录）
-建议 Python 3.11+。仓库锁定 PlatformIO 6.2.0、espressif8266 4.2.1（ESP8266 Arduino 3.1.2）和 ArduinoJson 6.21.5。
+ESP8266 Arduino 3.1.2 的 continuation 栈为 4096 字节。旧版优化构建把 `receivePoll` 和 `updateFirmware` 内联进 `tick`，连没有任务的普通轮询也预留了 OTA 的大块局部变量；旧版诊断构建中实测 `tick` 栈帧为 1376 字节。TLS 调用又叠加框架和加密调用栈，原版诊断中栈余量降到 48 字节，并直接捕获了保护值、stack_end、pc_ret、pc_suspend 被改写、`can_yield()=0`，随后 Soft WDT。
+
+本版把任务处理、OTA 连接和镜像流处理分成禁止内联的函数，避免把 OTA 的哈希对象和 512 字节缓冲提前带入轮询及 TLS 握手栈。编译器、框架、CPU 频率、MMU/共享 IRAM 堆、TLS 缓冲、超时、会话复用和证书验证均沿用 0.1.4。呼吸灯、RSA2048 签名升级、LittleFS 配置及任务序号保留。
+
+USB `status` 增加 `stack_ok`、`stack_free` 和 `reset_reason`。`stack_free` 是本次启动以来 continuation 栈的最低余量（字节），不是剩余堆内存。轮询 `boot_diag` 协议仍是 v1。
+
+## 构建
+
+Python 3.11+，依赖锁定 PlatformIO 6.2.0、espressif8266 4.2.1（Arduino 3.1.2）和 ArduinoJson 6.21.5。
 
 ```sh
-git clone --branch snapshot/minimal-agent-0.1.4-breathe-diag --single-branch https://github.com/dignifnrfb/esp8266-minimal-agent.git
-cd esp8266-minimal-agent
 python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# Linux/macOS 则使用：source .venv/bin/activate
+# Windows: .venv\Scripts\Activate.ps1
+# Linux/macOS: source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m platformio run -e minimal_agent -j 1
 ```
 
-产物：`.pio/build/minimal_agent/firmware.bin` 和同目录 `firmware.elf`。
-目标 NodeMCU v2，4 MiB Flash / 1 MiB LittleFS，160 MHz、DIO，内存布局由 platformio.ini 指定。
+产物为 `.pio/build/minimal_agent/firmware.bin` 和配套 `firmware.elf`。NodeMCU v2，4 MiB Flash / 1 MiB LittleFS，160 MHz、DIO。以本分支的完整源码和 platformio.ini 构建，不要使用此前未通过实板验证的超时/内存候选。
 
-可选主机检查：安装 g++ 和 OpenSSL CLI 后运行 `python tools/check.py --skip-build`。原有测试检查协议和签名包，不验证呼吸灯的实际时序，也不能证明设备不会重启。本次仅发布已安装源码，未重新运行完整工具链测试。
+主机检查需要 g++ 和 OpenSSL CLI：
 
-Windows 可用 `Get-FileHash src/minimal/main.cpp -Algorithm SHA256` 检查源码；Linux 使用 `sha256sum src/minimal/main.cpp`。
+```sh
+python tools/check.py --skip-build
+```
 
-## 当前行为及排查边界
-- GPIO2 / D4 板载 LED，低电平点亮；首次认证轮询成功后启动随机平滑呼吸。
-- PWM 1 kHz，范围显式设为 1023，亮度约 10%～80%。每轮 2～6 秒是有效动画时间；同步 TLS/HTTP/OTA 会暂停亮度包络，因此墙钟周期可能更长。
-- 每次轮询附带同一个 boot_diag：版本 v=1、reason、boot_heap、prev_valid=false；reason 1～3 时附带 exccause、epc1、excvaddr。服务器必须支持该字段。
-- 不写 RTC 或额外 Flash 故障日志。突然断电或首次成功上报前的重启可能没有完整记录，boot_heap 只是重启后的快照。
-- 已观察到软件看门狗（reason=3）及硬件看门狗（reason=1）重启，根因尚未确认。硬件看门狗不等于硬件损坏。
-- exccause=4 是一级中断，该情况下 EXCVADDR 不更新，不能把 excvaddr 当作非法访问地址。匹配 ELF 的 epc1 符号有助分析，但单个地址不等于根因。
-- 完整串口崩溃输出可能有更多信息，应用串口速率 115200；启动 ROM 输出使用 74880。保存与固件匹配的 ELF，分享日志前去除凭据和个人网络信息。
+## 验证
 
-参考：[官方 SDK reset 枚举](https://github.com/esp8266/Arduino/blob/3.1.2/tools/sdk/include/user_interface.h)、[官方异常代码表](https://arduino-esp8266.readthedocs.io/en/3.1.2/exception_causes.html)。
+实板 COM9 验证：连续 600.2 秒，新增 133 次成功轮询，boot_id 不变，无看门狗复位，栈保护值全程正常，最低栈余量 964 字节。主动软件重启后已恢复 7 次成功轮询，配置、公钥就绪状态及任务高水位保留。45 项协议检查和 9 项签名包检查通过。
 
-## 配置和升级注意
-本仓库不含真实 Wi-Fi 密码、设备 Token、生产公私钥、服务端凭据或设备配置；这些仍由设备持有者私下保管。配置沿用 LittleFS，不应为排查直接擦除或上传文件系统。
+主机协议和签名包检查不替代实板 HTTPS OTA 验收。生产私钥在服务器；本次 USB 烧录不能证明签名 OTA 下载、提交及新版本心跳已经通过。
 
-[原始基线的协议及 USB 配置说明](https://github.com/dignifnrfb/esp8266-minimal-agent/blob/f472400415fe753edae1733d4a2049d6aef953f1/README.md)中的示例版本号属于旧版本，配置格式与签名协议仍适用。不要运行 keygen 替换现有生产签名身份；普通本地构建不需要私钥。这个分支没有自动回滚能力，错误固件可能需要 USB 恢复。
+[完整排查与修复日志](docs/fixes/2026-10-24-tls-stack-overflow.md)记录了复位证据、未通过的对照、栈帧变化及实板结果，并附有可读取的 JSON 验证摘要。
+
+## 功能和配置
+
+- GPIO2 / D4 板载 LED，LOW 亮；首次成功轮询后开始 1 kHz 随机平滑呼吸。每轮 2～6 秒为有效动画时间，同步网络请求会暂停亮度包络。
+- 保留 CA、域名、时间和 TLS1.2 验证，接收/发送缓冲为 16384/1024 字节，TLS admission 为 28500 字节。
+- 协议1，支持 status、device_inspect(environment)、firmware_update。OTA 包仍为镜像 + RSA2048 PKCS#1 v1.5 SHA256 签名 + 小端签名长度。
+- Wi-Fi、设备 Token、CA、公钥、任务高水位及 ACK 继续保存在 LittleFS。升级时不要擦除或上传文件系统，不要重新生成生产签名身份。
+- 不额外写 RTC 或 Flash 故障日志；保留实际构建的 ELF 供解码。
+
+仓库不含真实凭据、生产签名材料、设备配置、整片 Flash 或原始串口捕获。
+
+[基线协议与 USB 配置说明](https://github.com/dignifnrfb/esp8266-minimal-agent/blob/f472400415fe753edae1733d4a2049d6aef953f1/README.md)的配置和签名协议仍适用；示例版本号属于旧版。

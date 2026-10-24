@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-24",
+  "version": "minimal-agent-0.1.5-stack-fix",
+  "base_commit": "256564e7dc47f57a5c4445c0a672cc39db81662b",
+  "target": "esp8266:nodemcuv2:4m1m",
+  "root_cause": "Continuation stack exhaustion and control-data corruption during TLS; compiler inlining reserved OTA locals in ordinary polling.",
+  "continuation_stack_bytes": 4096,
+  "baseline_diagnostic_tick_frame_bytes": 1376,
+  "baseline_diagnostic_lowest_stack_bytes": 48,
+  "direct_diagnostic_observations": {
+    "stack_end": "0x401035fc",
+    "expected_stack_end": "0x3fffffd0",
+    "stack_guard1": "0x3ffede48",
+    "expected_guard1": "0xfeefeffe",
+    "continuation_control_data_corrupted": true,
+    "can_yield": false,
+    "soft_wdt_followed": true
+  },
+  "final_function_frames_bytes": {
+    "tick": 192,
+    "receivePoll": 256,
+    "updateFirmware": 432,
+    "streamFirmware": 800
+  },
+  "split_function_control": {
+    "duration_s": 300.14,
+    "successful_polls": 69,
+    "observed_boots": 1,
+    "minimum_stack_bytes": 964
+  },
+  "final_steady_verification": {
+    "duration_s": 600.19,
+    "successful_polls": 133,
+    "observed_boots": 1,
+    "watchdog_resets": 0,
+    "minimum_stack_bytes": 964,
+    "all_stack_guards_valid": true,
+    "observed_connection_failure_recovered_without_reboot": true
+  },
+  "controlled_reboot": {
+    "passed": true,
+    "expected_reset_reason": 4,
+    "uptime_at_recovery_s": 31,
+    "successful_polls_after_reboot": 7,
+    "additional_resets": 0,
+    "configuration_and_signing_readiness_preserved": true,
+    "task_high_water_preserved": true
+  },
+  "host_checks": {
+    "firmware_build_passed": true,
+    "protocol_checks_passed": 45,
+    "signature_package_checks_passed": 9,
+    "official_framework_signer_comparison_passed": true
+  },
+  "firmware_bytes": 466048,
+  "firmware_sha256": "e50844914faafd6a2f79c4627f051fe8e8b5206bc5b8c140de0ff94128d8a0f4",
+  "main_cpp_sha256": "da3e9e3b502d34a4947b7d465da34cca5b381bb2b24cc9b384545fa34a41f5c0",
+  "usb_write_hash_verified": true,
+  "new_revision_production_signed_https_ota_tested": false,
+  "raw_captures_and_device_configuration_included": false
+}
