@@ -9,16 +9,18 @@
 #include <umm_malloc/umm_heap_select.h>
 #include <time.h>
 #include <cont.h>
+#include <Ticker.h>
+#include <Adafruit_ST7735.h>
 #include "protocol.h"
 
 extern "C" uint32_t _FS_start, _FS_end;
 namespace {
-constexpr char Version[] = "minimal-agent-0.1.5-stack-fix";
-// User-confirmed board LED: GPIO2 / D4. Do not touch any other GPIO.
+constexpr char Version[] = "minimal-agent-0.1.9-tft-calibration";
+// User-confirmed board LED: GPIO2 / D4, separate from the TFT pins.
 constexpr uint8_t DemoLedPin = 2;
 // User confirmed LOW = on and HIGH = off; no other GPIO is probed.
 constexpr bool DemoLedActiveLow = true;
-bool demoLedStarted = false;
+Ticker ledTicker;
 constexpr char ConfigFile[] = "/minimal.json";
 // Preserve the same high-water/result journal when changing firmware families.
 constexpr char JournalFile[] = "/gateway-job.json";
@@ -36,47 +38,120 @@ void setDemoLed(bool on) {
   digitalWrite(DemoLedPin, (on != DemoLedActiveLow) ? HIGH : LOW);
 }
 // One 1 kHz software-PWM channel. No user ISR, allocation or delay here.
-constexpr uint16_t LedRange = 1023, LedMinimum = 103, LedMaximum = 818;
+constexpr uint16_t LedRange = 1023, LedMinimum = 6, LedMaximum = 818;
 uint16_t ledFrom = LedMinimum, ledTo = LedMinimum, ledNextLow = LedMinimum;
 uint32_t ledLast = 0, ledElapsed = 0, ledHalfPeriod = 1000;
 bool ledRising = true;
+uint32_t ledPrng = 1;
+uint16_t ledWritten = LedMinimum;
+volatile uint32_t ledMaxGapMs = 0, ledMaxCallbackUs = 0;
 uint32_t ledRandom(uint32_t first, uint32_t last) {
-  return first + ESP.random() % (last - first + 1);
+  // Local noncryptographic PRNG: no SDK/random API inside SYS callback.
+  ledPrng ^= ledPrng << 13; ledPrng ^= ledPrng >> 17; ledPrng ^= ledPrng << 5;
+  return first + ledPrng % (last - first + 1);
 }
 void nextLedCycle() {
   // Previous falling endpoint is the next rising start: no cycle-boundary jump.
-  ledTo = ledRandom(563, LedMaximum); // peak 55..80 percent
-  ledNextLow = ledRandom(LedMinimum, 358); // trough 10..35 percent
-  ledHalfPeriod = ledRandom(1000, 3000); // full cycle 2..6 active seconds
+  ledTo = ledRandom(614, LedMaximum); // peak 60..80 percent duty
+  ledNextLow = ledRandom(LedMinimum, 20); // trough approximately 0.6..2 percent duty
+  ledHalfPeriod = ledRandom(1000, 3000); // rising segment 1..3 active seconds
   ledRising = true; ledElapsed = 0;
 }
 uint16_t ledCurve(uint16_t from, uint16_t to, uint32_t elapsed, uint32_t duration) {
   uint32_t t = min<uint32_t>(elapsed, duration) * 1024u / duration;
   uint32_t eased = t * t * (3072u - 2u * t) / 1048576u;
-  return static_cast<uint16_t>(static_cast<int32_t>(from) +
-      (static_cast<int32_t>(to) - from) * static_cast<int32_t>(eased) / 1024);
+  // Shape a low-to-high perceptual envelope with an integer gamma~2 curve.
+  // Reverse the same curve on descent, rather than squaring signed deltas.
+  // This is an approximation, not calibrated optical brightness.
+  uint32_t level = to >= from ? eased : 1024u - eased;
+  uint32_t gamma = level * level; // Q20, <= 1048576
+  uint16_t low = min<uint16_t>(from, to), high = max<uint16_t>(from, to);
+  return low + static_cast<uint32_t>(high - low) * gamma / 1048576u;
 }
 void tickDemoLed() {
-  if (!demoLedStarted) {
-    if (!(pollsOk > 0 && enabled && !paused && WiFi.status() == WL_CONNECTED)) return;
-    demoLedStarted = true; ledLast = millis(); nextLedCycle();
-    analogWrite(DemoLedPin, LedRange - LedMinimum);
-    return;
-  }
   uint32_t now = millis(), elapsed = now - ledLast;
+  if (elapsed > ledMaxGapMs) ledMaxGapMs = elapsed;
   if (elapsed < 10) return;
   ledLast = now;
-  // Synchronous HTTP/OTA can stall loop(). Freeze rather than skip visibly
-  // through the envelope after a stall. Wall-clock cycles can exceed 6 s.
+  // Raw SDK SYS timer, not a loop-scheduled callback. Normal network waits
+  // service SDK timers; non-yielding CPU/flash sections may still delay us.
+  // Cap catch-up to preserve smoothness after an exceptional scheduler gap.
   ledElapsed = min<uint32_t>(ledElapsed + min<uint32_t>(elapsed, 20), ledHalfPeriod);
   uint16_t brightness = ledCurve(ledFrom, ledTo, ledElapsed, ledHalfPeriod);
-  analogWrite(DemoLedPin, LedRange - brightness); // active LOW
+  if (brightness != ledWritten) {
+    analogWrite(DemoLedPin, LedRange - brightness); // SYS-safe, never ISR
+    ledWritten = brightness;
+  }
   if (ledElapsed == ledHalfPeriod) {
     ledFrom = ledTo;
-    if (ledRising) { ledTo = ledNextLow; ledRising = false; ledElapsed = 0; }
+    if (ledRising) {
+      ledTo = ledNextLow; ledRising = false; ledElapsed = 0;
+      ledHalfPeriod = ledRandom(1000, 3000); // independent falling duration
+    }
     else nextLedCycle();
   }
 }
+// This callback runs in SDK SYS context, NOT timer1 ISR or CONT/TLS stack.
+// It owns PWM writes after setup. No String, allocation, I/O or explicit yield.
+void ledTimerCallback(void*) {
+  uint32_t started = micros();
+  tickDemoLed();
+  uint32_t duration = micros() - started;
+  if (duration > ledMaxCallbackUs) ledMaxCallbackUs = duration;
+}
+void startLocalLed() {
+  ledPrng = ESP.random(); if (!ledPrng) ledPrng = 1;
+  ledLast = millis(); nextLedCycle();
+  analogWrite(DemoLedPin, LedRange - LedMinimum); // initialize core PWM first
+  ledTicker.attach_ms(10, ledTimerCallback, static_cast<void*>(nullptr));
+}
+// First-display test: hardware HSPI defaults to SCK D5/GPIO14 and MOSI D7/GPIO13.
+// SPI.begin also configures unused MISO D6/GPIO12; leave it unconnected.
+// User wiring: RS/DC D1/GPIO5, CS D2/GPIO4, RES D0/GPIO16. No D8 HW CS.
+constexpr int8_t TftCsPin = 4, TftDcPin = 5, TftResetPin = 16;
+constexpr uint32_t TftSpiHz = 4000000;
+// initR -> commonInit -> virtual begin otherwise defaults to 32 MHz. Override
+// that hook so both initialization commands AND drawing use conservative 4 MHz.
+class FirstDisplay : public Adafruit_ST7735 {
+ public:
+  FirstDisplay() : Adafruit_ST7735(TftCsPin, TftDcPin, TftResetPin) {}
+ protected:
+  void begin(uint32_t) override { Adafruit_ST77xx::begin(TftSpiHz); }
+};
+FirstDisplay tft;
+void startDisplayTest() {
+  // One boot-only pass in setup/CONT, never in the LED SYS callback or TLS path.
+  // Photo showed red/blue swapped and incomplete frame with GREENTAB (2,1).
+  // BLACKTAB selects RGB, offsets (0,0); physical edge calibration still needs
+  // a fresh photo. This is a driver profile, not the PCB color or panel ID.
+  tft.initR(INITR_BLACKTAB); // library reset/sleep delays yield to SDK and WDT
+  tft.setRotation(0);
+  // No framebuffer, canvas, dynamic image allocation, reads or retry loop.
+  // Each fill is at most 128 pixels; yield AFTER the transaction ends.
+  for (int16_t y = 0; y < 160; ++y) {
+    tft.drawFastHLine(0, y, 128, ST77XX_BLACK);
+    yield();
+  }
+  // Four labelled bars and an outer frame make color/order/offsets inspectable.
+  for (int16_t y = 48; y < 96; ++y) {
+    tft.drawFastHLine(4, y, 30, ST77XX_RED);
+    tft.drawFastHLine(34, y, 30, ST77XX_GREEN);
+    tft.drawFastHLine(64, y, 30, ST77XX_BLUE);
+    tft.drawFastHLine(94, y, 30, ST77XX_WHITE);
+    yield();
+  }
+  tft.drawRect(0, 0, 128, 160, ST77XX_WHITE);
+  yield();
+  tft.setTextWrap(false); tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(6, 10); tft.print(F("HELLO ESP8266")); yield();
+  tft.setCursor(6, 24); tft.print(F("ST7735S 128x160")); yield();
+  tft.setCursor(12, 102); tft.print(F("R    G    B    W")); yield();
+  tft.setCursor(6, 122); tft.print(F("0.1.9 CALIBRATION")); yield();
+  tft.setCursor(6, 140); tft.print(F("BLACK TAB / 4MHz")); yield();
+  // No 'display OK' claim: write-only wiring cannot verify visible pixels.
+}
+
 // Immutable boot evidence. No raw reset strings, credentials, flash writes or
 // RTC user memory (whose first 128 bytes are reserved for the OTA bootloader).
 uint32_t bootHeap = 0;
@@ -171,6 +246,8 @@ void state(JsonObject o) {
   o["stack_ok"] = stackOk;
   o["stack_free"] = stackOk ? ESP.getFreeContStack() : 0;
   o["reset_reason"] = bootReason;
+  o["led_max_gap_ms"] = static_cast<uint32_t>(ledMaxGapMs);
+  o["led_max_callback_us"] = static_cast<uint32_t>(ledMaxCallbackUs);
 }
 String status() {
   DynamicJsonDocument d(1536); state(d.to<JsonObject>());
@@ -419,7 +496,9 @@ void setup() {
   setDemoLed(false); pinMode(DemoLedPin, OUTPUT);
   analogWriteRange(LedRange); analogWriteFreq(1000);
   captureBootDiagnostic();
+  startLocalLed(); // starts even without configuration, Wi-Fi, clock or server
   Serial.begin(115200);
+  startDisplayTest(); // bounded, one-time local test; no server dependency
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true);
   WiFi.hostname("esp8266-minimal");
   device = "esp8266-" + WiFi.macAddress(); device.replace(":", ""); device.toLowerCase();
@@ -446,4 +525,4 @@ void setup() {
   configTime(0,0,"ntp.aliyun.com","time.cloudflare.com","pool.ntp.org");
   Serial.println(); Serial.println(status());
 }
-void loop() { serialControl(); tickDemoLed(); tick(); delay(1); }
+void loop() { serialControl(); tick(); delay(1); }

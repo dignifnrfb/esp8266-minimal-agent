@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "version": "minimal-agent-0.1.9-tft-calibration",
+  "source_base_commit": "fa81ac157fdc6e6efeac598fdbe25f5b9c6422e0",
+  "target": "esp8266:nodemcuv2:4m1m",
+  "source_sha256": {
+    "src/minimal/main.cpp": "b285b944777207d936a95dd2cd88d577319b73f9801bd8041494d3a15be5934c",
+    "src/minimal/protocol.h": "e8411c91c94d9aeba131057f03aae884d3894794bb12fe3403ea75e1f6b9bf01",
+    "platformio.ini": "87f4acc2c27311d850ffe429d4cf14f8d4bc9ea47c881f211419850c2acff5cc"
+  },
+  "toolchain": {
+    "platformio": "6.2.0",
+    "platform": "espressif8266@4.2.1",
+    "arduino": "3.1.2",
+    "gcc": "10.3.0"
+  },
+  "target_build_passed": true,
+  "ram_used_bytes": 32220,
+  "flash_used_bytes": 474087,
+  "recorded_raw_binary": {
+    "included_in_repository": false,
+    "bytes": 478240,
+    "sha256": "4bf4a47106d5c67b1638f9bc91b228c954f6cd5d20fe8241aaad4f8a1aa05ad5"
+  },
+  "recorded_elf": {
+    "included_in_repository": false,
+    "sha256": "6926b813c957a70337248968246e0f7ade6f139c276eef8d7042741035837518"
+  },
+  "hardware_calibration_verified": false,
+  "watchdog_fix": false,
+  "ota_install_verified": false,
+  "latest_attempt_result": "Old 0.1.8 restarted during OTA; 0.1.9 not installed."
+}
